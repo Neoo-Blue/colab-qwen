@@ -19,6 +19,12 @@ opens the one-time Google sign-in).
 from __future__ import annotations
 
 import argparse
+import sys
+
+if sys.platform == "win32":  # fcntl, process groups and `sh` below are Unix-only, as is the Colab CLI
+    sys.exit("qwenx: native Windows is not supported (the Colab CLI is macOS/Linux only). "
+             "Run it inside WSL2: see README, 'Windows'.")
+
 import base64
 import contextlib
 import fcntl
@@ -28,7 +34,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 

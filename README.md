@@ -6,22 +6,68 @@ GPU, serves the model with Ollama, gets the answer, and stops the GPU in the sam
 is left running between tasks.
 
 - **`SKILL.md`**: when to use it (and when not), the workflow, hard rules, models, and cost
-- **`qwenx`**: the CLI (stdlib-only Python 3.10+). `run`, `batch`, `stop`, `status`, `selftest`
+- **`qwenx`**: the CLI (stdlib-only Python 3.8+; macOS, Linux, Windows via WSL2). `run`, `batch`, `stop`, `status`, `selftest`
 - **`agents/colab-qwen-worker.md`**: a sub-agent relay so Claude can dispatch a task in the
   background via the Agent tool
 
 ## Install
 
+The Colab CLI runs on macOS and Linux only, so on Windows everything below runs inside WSL2.
+The steps after the first one are identical on all three.
+
+### 1. Prerequisite per OS
+
+**macOS**
 ```bash
-uv tool install google-colab-cli                     # official Colab CLI (`colab`)
-colab usage                                          # one-time Google sign-in
+brew install uv            # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**Linux** (any distro with Python 3 and git)
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc if not already there
+```
+
+**Windows**: open PowerShell as administrator:
+```powershell
+wsl --install -d Ubuntu
+```
+Reboot, open the **Ubuntu** app, and run the Linux step above inside it. Run Claude Code
+(or Codex, OpenCode, etc.) inside WSL too, so the agent and `qwenx` share one environment.
+Native Windows `qwenx` exits with a message pointing here.
+
+### 2. Colab CLI and sign-in
+
+```bash
+uv tool install google-colab-cli
+colab usage      # first call signs in. With a browser it opens one; on a headless server
+                 # or WSL it prints a URL, you sign in anywhere and paste the code back
+```
+
+Needs Colab Pro or Pro+ (A100 access and compute units).
+
+### 3. The skill
+
+```bash
+mkdir -p ~/.claude/skills ~/.claude/agents ~/.local/bin
 git clone https://github.com/Neoo-Blue/colab-qwen ~/.claude/skills/colab-qwen
 ln -sf ~/.claude/skills/colab-qwen/qwenx ~/.local/bin/qwenx
 cp ~/.claude/skills/colab-qwen/agents/colab-qwen-worker.md ~/.claude/agents/
 qwenx selftest
 ```
 
-Needs Colab Pro or Pro+ (A100 access and compute units). macOS or Linux.
+### 4. Other agent tools (optional)
+
+Every tool runs the same `qwenx` CLI; these links just make each one load the skill.
+
+| Tool | Needs |
+|---|---|
+| Claude Code | step 3 (skill + `colab-qwen-worker` sub-agent) |
+| OpenCode, Muse, Grok Build | nothing more: they read `~/.claude/skills` |
+| Codex (and others using the shared folder) | `mkdir -p ~/.agents/skills && ln -sfn ~/.claude/skills/colab-qwen ~/.agents/skills/colab-qwen` |
+| Antigravity (`agy`) | `mkdir -p ~/.gemini/config/skills && ln -sfn ~/.claude/skills/colab-qwen ~/.gemini/config/skills/colab-qwen` |
+
+Update everything later with `git -C ~/.claude/skills/colab-qwen pull`.
 
 ## Use
 

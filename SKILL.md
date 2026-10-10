@@ -128,13 +128,25 @@ Flags shared by `run` and `batch`: `-m MODEL`, `-s SESSION` (default `qwen-a100`
 
 ## Setup (once)
 
+Same steps on every OS; Windows runs them inside WSL2 (the Colab CLI is macOS/Linux only).
+
+| OS | Before the common steps |
+|---|---|
+| macOS | `brew install uv` (or `curl -LsSf https://astral.sh/uv/install.sh \| sh`) |
+| Linux | `curl -LsSf https://astral.sh/uv/install.sh \| sh`; make sure `~/.local/bin` is on `PATH` |
+| Windows | PowerShell as admin: `wsl --install -d Ubuntu`, reboot, open Ubuntu, then follow the Linux row. Use the skill from tools running inside WSL |
+
+Common steps:
+
 ```bash
 uv tool install google-colab-cli      # the official Colab CLI, provides `colab`
-colab usage                           # first call opens the Google sign-in
+colab usage                           # first call signs in; on a headless box or WSL it
+                                      # prints a URL and asks you to paste the code back
 qwenx selftest
 ```
 
-Requires Colab Pro or Pro+ for A100 access and compute units.
+Requires Colab Pro or Pro+ for A100 access and compute units. Full install, including the
+links for other agent tools, is in `README.md`.
 
 ## How it works, and the gotchas it handles
 
