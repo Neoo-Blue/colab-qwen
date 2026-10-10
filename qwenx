@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""qwenx: run a Qwen (or any Ollama) model on a Colab A100 as a one-shot task worker.
+
+Every run is one GPU lifetime: colab new -> install + serve Ollama -> pull model -> answer
+-> colab stop. The GPU never outlives the command: try/finally, SIGTERM/SIGHUP handlers, and
+a detached watchdog that runs `colab stop` after --max-minutes even if qwenx is SIGKILLed.
+
+  qwenx run   [-m MODEL] [--think] [--ctx N] [-f FILE]... "prompt"   ("-" = prompt from stdin,
+                                                                     "-f -" = stdin as context)
+  qwenx batch [-m MODEL] -o OUTDIR TASK.md [TASK.md ...]             one GPU session, many prompts
+  qwenx stop  [-s NAME]   stop a leftover session (always safe to run)
+  qwenx status            active Colab sessions + compute-unit balance and burn rate
+  qwenx selftest          offline check of the wrapper, makes no Colab call
+
+Answer goes to stdout, progress and the cost line to stderr. --json prints raw results.
+Needs the official Colab CLI: `uv tool install google-colab-cli` (then any `colab` command
+opens the one-time Google sign-in).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_MODEL = os.environ.get("QWENX_MODEL", "qwen3.8:27b")
+DEFAULT_SESSION = os.environ.get("QWENX_SESSION", "qwen-a100")
+DEFAULT_GPU = os.environ.get("QWENX_GPU", "A100")
+STATE = Path(os.environ.get("QWENX_STATE", Path.home() / ".cache" / "colab-qwen"))
+BEGIN, END = "<<<QWENX_BEGIN>>>", "<<<QWENX_END>>>"
+SYSTEM = ("You are a delegated worker for another AI agent. Do the task completely and "
+          "directly. No preamble, no offers of further help. If something is ambiguous, state "
+          "the assumption you made in one line and proceed.")
+
+# Runs inside the Colab kernel (Python). Idempotent: safe to re-run on a warm session.
+BOOTSTRAP = r'''
+import json, os, shutil, subprocess, time, urllib.request
+def _up():
+    try:
+        urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=2)
+        return True
+    except Exception:
+        return False
+if not shutil.which("ollama"):
+    subprocess.run("(command -v zstd >/dev/null || (apt-get -qq update && apt-get -qq install -y zstd)) "
+                   ">/content/ollama-install.log 2>&1; curl -fsSL https://ollama.com/install.sh | sh "
+                   ">>/content/ollama-install.log 2>&1", shell=True, check=True)
+if not _up():
+    env = dict(os.environ, OLLAMA_HOST="127.0.0.1:11434", OLLAMA_KEEP_ALIVE="-1",
+               OLLAMA_FLASH_ATTENTION="1")
+    subprocess.Popen(["ollama", "serve"], env=env, stdout=open("/content/ollama.log", "w"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(90):
+        if _up():
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError("ollama serve did not start:\n" + open("/content/ollama.log").read()[-2000:])
+_p = subprocess.run(["ollama", "pull", MODEL], capture_output=True, text=True)
+if _p.returncode:
+    raise RuntimeError("ollama pull %s failed: %s" % (MODEL, (_p.stderr or _p.stdout)[-1500:]))
+_gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                      capture_output=True, text=True).stdout.strip()
+print(BEGIN)
+print(json.dumps({"gpu": _gpu}))
+print(END)
+'''
+
+GENERATE = r'''
+import base64, json, urllib.error, urllib.request
+_req = json.loads(base64.b64decode(REQ_B64))
+def _chat(body):
+    r = urllib.request.Request("http://127.0.0.1:11434/api/chat", data=json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(r, timeout=TIMEOUT).read())
+try:
+    _out = _chat(_req)
+except urllib.error.HTTPError as e:
+    if "think" in _req and "think" in e.read().decode(errors="replace").lower():
+        _req.pop("think")  # model has no thinking switch; ask again without it
+        _out = _chat(_req)
+    else:
+        raise
+_m = _out.get("message", {})
+print(BEGIN)
+print(json.dumps({"content": _m.get("content", ""), "thinking": _m.get("thinking", ""),
+                  "eval_count": _out.get("eval_count", 0), "eval_ns": _out.get("eval_duration", 0),
+                  "prompt_count": _out.get("prompt_eval_count", 0),
+                  "total_ns": _out.get("total_duration", 0)}))
+print(END)
+'''
+
+
+class QwenxError(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"[qwenx] {msg}", file=sys.stderr, flush=True)
+
+
+def colab(*args: str, code: str | None = None, timeout: float | None = None,
+          check: bool = True) -> subprocess.CompletedProcess:
+    try:
+        r = subprocess.run(["colab", *args], input=code, text=True, capture_output=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise QwenxError(f"`colab {args[0]}` timed out after {timeout:.0f}s") from e
+    if check and r.returncode:
+        raise QwenxError(f"`colab {' '.join(args)}` failed (exit {r.returncode}): "
+                         f"{(r.stderr + r.stdout).strip()[-1200:]}")
+    return r
+
+
+def payload(text: str) -> dict:
+    """Pull the JSON line between the last BEGIN/END markers out of kernel output.
+    `colab exec` exits 0 even when the remote code raised, so a missing marker IS the error."""
+    i = text.rfind(BEGIN)
+    j = text.find(END, i + 1) if i >= 0 else -1
+    if i < 0 or j < 0:
+        raise QwenxError("remote step produced no result marker (it raised on the VM):\n"
+                         + text.strip()[-2000:])
+    return json.loads(text[i + len(BEGIN):j].strip())
+
+
+def remote(session: str, prelude: dict, body: str, timeout: float) -> dict:
+    code = "".join(f"{k} = {v!r}\n" for k, v in prelude.items())
+    code += f"BEGIN = {BEGIN!r}\nEND = {END!r}\n" + body
+    r = colab("exec", "-s", session, "--timeout", str(int(timeout)), code=code,
+              timeout=timeout + 120, check=False)
+    if r.returncode and BEGIN not in r.stdout:
+        raise QwenxError(f"`colab exec` failed (exit {r.returncode}): "
+                         f"{(r.stderr + r.stdout).strip()[-2000:]}")
+    return payload(r.stdout + "\n" + r.stderr)
+
+
+def strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S).strip()
+
+
+def build_request(model: str, prompt: str, system: str, ctx: int, think: bool | None) -> dict:
+    req = {"model": model, "stream": False, "keep_alive": -1,
+           "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+           "options": {"num_ctx": ctx}}
+    if think is not None:
+        req["think"] = think
+    return req
+
+
+def read_prompt(words: list[str], files: list[str]) -> str:
+    # stdin is read only when asked for ("-" as prompt or "-f -"): callers such as agent
+    # harnesses can leave stdin open, and an implicit read would block forever.
+    text = " ".join(words).strip()
+    if text == "-":
+        text = sys.stdin.read().strip()
+    if not text:
+        raise QwenxError("empty prompt: pass it as an argument, or '-' with the prompt on stdin")
+    parts = [text]
+    for f in files:
+        body = sys.stdin.read() if f == "-" else Path(f).read_text(errors="replace")
+        parts.append(f"--- {'CONTEXT' if f == '-' else 'FILE: ' + f} ---\n{body.rstrip()}")
+    return "\n\n".join(parts)
+
+
+def _kill_watchdog() -> None:
+    pidfile = STATE / "watchdog.pid"
+    try:
+        os.killpg(int(pidfile.read_text()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    pidfile.unlink(missing_ok=True)
+
+
+def _raise_interrupt(signum, _frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def session_lifetime(args, jobs):
+    """Yield (name, result-or-exception) per job inside ONE GPU session, then always stop it."""
+    if not shutil.which("colab"):
+        raise QwenxError("Colab CLI not installed: `uv tool install google-colab-cli`")
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / f"{args.session}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise QwenxError(f"another qwenx run holds session '{args.session}'; wait, or use -s NAME")
+
+    _kill_watchdog()  # left behind by a run that was SIGKILLed
+    colab("stop", "-s", args.session, check=False, timeout=90)  # leftover with our name, if any
+    wd = subprocess.Popen(
+        ["sh", "-c", f"sleep {int(args.max_minutes * 60)}; colab stop -s {args.session}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    (STATE / "watchdog.pid").write_text(str(wd.pid))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_interrupt)
+
+    t0, rate = time.time(), None
+    try:
+        log(f"allocating {args.gpu} as session '{args.session}' (watchdog stops it at "
+            f"{args.max_minutes:g} min)")
+        new = ["new", "-s", args.session, "--gpu", args.gpu] + (["--high-mem"] if args.high_mem else [])
+        colab(*new, timeout=600)
+        log(f"VM up in {time.time() - t0:.0f}s; installing Ollama and pulling {args.model}")
+        info = remote(args.session, {"MODEL": args.model}, BOOTSTRAP, args.boot_timeout)
+        log(f"ready at {time.time() - t0:.0f}s on {info.get('gpu') or args.gpu}")
+        m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
+        rate = float(m.group(1)) if m else None
+        for name, prompt in jobs:
+            t1 = time.time()
+            try:
+                req = build_request(args.model, prompt, args.system, args.ctx, args.think)
+                res = remote(args.session, {
+                    "REQ_B64": base64.b64encode(json.dumps(req).encode()).decode(),
+                    "TIMEOUT": args.gen_timeout}, GENERATE, args.gen_timeout)
+                res["content"] = strip_think(res["content"])
+                res["wall_s"] = round(time.time() - t1, 1)
+                yield name, res
+            except QwenxError as e:
+                yield name, e
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # nothing may interrupt the stop
+        stopped = False
+        for attempt in range(3):
+            r = colab("stop", "-s", args.session, check=False, timeout=120)
+            if r.returncode == 0:
+                stopped = True
+                break
+            time.sleep(2 ** attempt)
+        if stopped:
+            _kill_watchdog()
+        else:
+            log(f"WARNING: `colab stop -s {args.session}` failed 3 times; the watchdog is still "
+                f"armed. Check `qwenx status` now.")
+        mins = (time.time() - t0) / 60
+        cost = f" ~{rate * mins / 60:.2f} CU at {rate:g} CU/h" if rate else ""
+        log(f"session {'stopped' if stopped else 'NOT CONFIRMED STOPPED'} after {mins:.1f} min{cost}")
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        lock.close()
+
+
+def meta_line(model: str, res: dict) -> str:
+    tok, ns = res.get("eval_count", 0), res.get("eval_ns", 0) or 1
+    return (f"{model}: {res.get('prompt_count', 0)} prompt tok, {tok} out tok, "
+            f"{tok / (ns / 1e9):.0f} tok/s, {res.get('wall_s', 0)}s")
+
+
+def cmd_run(args) -> int:
+    prompt = read_prompt(args.prompt, args.file)
+    with contextlib.closing(session_lifetime(args, [("run", prompt)])) as it:
+        results = list(it)
+    for _, res in results:
+        if isinstance(res, Exception):
+            raise res
+        if args.json:
+            print(json.dumps(res, indent=1))
+        else:
+            log(meta_line(args.model, res))
+            print(res["content"])
+    return 0
+
+
+def cmd_batch(args) -> int:
+    out = Path(args.outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    jobs = [(Path(t).stem, Path(t).read_text(errors="replace")) for t in args.tasks]
+    failed, summary = 0, []
+    with contextlib.closing(session_lifetime(args, jobs)) as it:
+        results = list(it)
+    for name, res in results:
+        if isinstance(res, Exception):
+            failed += 1
+            (out / f"{name}.error.txt").write_text(str(res))
+            log(f"{name}: FAILED ({str(res).splitlines()[0]})")
+            summary.append({"task": name, "ok": False, "error": str(res)})
+        else:
+            (out / f"{name}.md").write_text(res["content"] + "\n")
+            log(f"{name}: {meta_line(args.model, res)} -> {out / (name + '.md')}")
+            summary.append({"task": name, "ok": True, "path": str(out / f"{name}.md")})
+    print(json.dumps(summary, indent=1) if args.json else
+          "\n".join(f"{s['task']}: {s.get('path') or 'FAILED'}" for s in summary))
+    return 1 if failed else 0
+
+
+def cmd_stop(args) -> int:
+    r = colab("stop", "-s", args.session, check=False, timeout=120)
+    print((r.stdout + r.stderr).strip())
+    _kill_watchdog()
+    return r.returncode
+
+
+def cmd_status(_args) -> int:
+    for sub in ("sessions", "usage"):
+        r = colab(sub, check=False, timeout=60)
+        print((r.stdout + r.stderr).strip())
+    return 0
+
+
+def cmd_selftest(_args) -> int:
+    ok = {"content": "hi"}
+    assert payload(f"noise\n{BEGIN}\n{json.dumps(ok)}\n{END}\n") == ok
+    assert payload(f"{BEGIN}\nold\n{END}\n{BEGIN}\n{json.dumps(ok)}\n{END}") == ok
+    try:
+        payload("Traceback ... RuntimeError: boom")
+        raise AssertionError("missing marker must raise")
+    except QwenxError as e:
+        assert "boom" in str(e)
+    assert strip_think("<think>x\ny</think>\nanswer") == "answer"
+    req = build_request("m", "p", "s", 8192, None)
+    assert "think" not in req and req["options"]["num_ctx"] == 8192
+    assert build_request("m", "p", "s", 8192, False)["think"] is False
+    for body, prelude in ((BOOTSTRAP, {"MODEL": "m"}), (GENERATE, {"REQ_B64": "", "TIMEOUT": 1})):
+        compile("".join(f"{k} = {v!r}\n" for k, v in prelude.items()) + body, "remote", "exec")
+    print("selftest ok")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="qwenx", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def gpu_opts(p):
+        p.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"Ollama tag (default {DEFAULT_MODEL})")
+        p.add_argument("-s", "--session", default=DEFAULT_SESSION)
+        p.add_argument("--gpu", default=DEFAULT_GPU, help="T4, L4, G4, A100, H100 (default A100)")
+        p.add_argument("--high-mem", action="store_true", help="high-RAM machine shape")
+        p.add_argument("--ctx", type=int, default=32768, help="num_ctx per request (default 32768)")
+        th = p.add_mutually_exclusive_group()
+        th.add_argument("--think", dest="think", action="store_const", const=True,
+                        help="enable the model's reasoning mode (slower, better on hard problems)")
+        th.add_argument("--no-think", dest="think", action="store_const", const=False)
+        p.set_defaults(think=False)
+        p.add_argument("--system", default=SYSTEM, help="system prompt")
+        p.add_argument("--max-minutes", type=float, default=60,
+                       help="hard cap: the watchdog stops the VM after this (default 60)")
+        p.add_argument("--boot-timeout", type=float, default=1200, help="install+pull budget, s")
+        p.add_argument("--gen-timeout", type=float, default=1800, help="per-prompt budget, s")
+        p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("run", help="one prompt, one GPU lifetime")
+    gpu_opts(p)
+    p.add_argument("-f", "--file", action="append", default=[], help="attach a file as context ('-' = stdin)")
+    p.add_argument("prompt", nargs="*")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("batch", help="many prompt files, one GPU lifetime")
+    gpu_opts(p)
+    p.add_argument("-o", "--outdir", required=True)
+    p.add_argument("tasks", nargs="+", help="each file is one complete prompt")
+    p.set_defaults(fn=cmd_batch)
+
+    p = sub.add_parser("stop", help="stop a (leftover) session")
+    p.add_argument("-s", "--session", default=DEFAULT_SESSION)
+    p.set_defaults(fn=cmd_stop)
+
+    sub.add_parser("status", help="sessions + compute units").set_defaults(fn=cmd_status)
+    sub.add_parser("selftest", help="offline wrapper check").set_defaults(fn=cmd_selftest)
+
+    args = ap.parse_args()
+    try:
+        return args.fn(args)
+    except QwenxError as e:
+        log(f"error: {e}")
+        return 1
+    except KeyboardInterrupt:
+        log("interrupted; see the stop line above")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
