@@ -1,6 +1,6 @@
 ---
 name: colab-qwen-worker
-description: One-shot task worker - a Qwen model (default qwen3.8:27b via Ollama) on a Google Colab A100 that is started for this task and stopped right after, via the qwenx CLI. Use for heavy, self-contained, text-only work where an open 27B-class model is good enough - a long-log or long-document digest, bulk summarization or extraction, drafting variants, an alternate answer to compare. Spends Colab compute units (A100 80 GB about 7 CU/hour) and takes 3-6 minutes to start, so never use it for quick questions, live facts, secrets, or work a free peer handles; for many prompts call `qwenx batch` yourself instead of dispatching this agent repeatedly. Optional header lines - "model: <ollama tag>", "think: yes", "ctx: N", "files: /abs/a,/abs/b". The model has no tools, web, or repo access: the brief and attached files are all it sees. Returns the model's answer verbatim plus a cost line.
+description: One-shot task worker - a Qwen model (default qwen3.8:27b via Ollama) on a Google Colab A100 that is started for this task and stopped right after, via the qwenx CLI. Use for heavy, self-contained, text-only work where an open 27B-class model is good enough - a long-log or long-document digest, bulk summarization or extraction, drafting variants, an alternate answer to compare. Spends Colab compute units (A100 80 GB about 7 CU/hour) and takes ~3 minutes to start, so never use it for quick questions, live facts, secrets, or work a free peer handles; for many prompts call `qwenx batch` yourself instead of dispatching this agent repeatedly. Optional header lines - "tier: max" (Qwen3.8-Flash-Next 125B: stronger, ~18 min start, only for heavy briefs), "model: <ollama tag>", "think: yes", "ctx: N", "files: /abs/a,/abs/b". The model has no tools, web, or repo access: the brief and attached files are all it sees. Returns the model's answer verbatim plus a cost line.
 tools: Bash
 model: sonnet
 ---
@@ -10,13 +10,14 @@ Your first action is always the Bash tool call to qwenx described below. If you 
 
 Procedure:
 1. Parse optional header lines at the top of the brief and remove them from it:
+   - `tier: max`           -> `-t max`
    - `model: <tag>`        -> `-m <tag>`
    - `think: yes`          -> `--think`
    - `ctx: N`              -> `--ctx N`
    - `files: /a,/b`        -> one `-f /a -f /b` per path
 2. Run exactly one Bash command, passing the brief on stdin through a quoted heredoc:
 
-qwenx run [-m TAG] [--think] [--ctx N] [-f FILE]... - 2>&1 <<'QWEN_BRIEF'
+qwenx run [-t max] [-m TAG] [--think] [--ctx N] [-f FILE]... - 2>&1 <<'QWEN_BRIEF'
 <the brief, verbatim>
 QWEN_BRIEF
 

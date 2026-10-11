@@ -82,9 +82,19 @@ Claude pick it up from the skill description. From a shell:
 ```bash
 qwenx run "Summarize the failure modes in this log" -f app.log
 qwenx batch -o out/ tasks/*.md        # many prompts, one GPU session
+qwenx batch -t max -o out/ tasks/*.md # max tier: Qwen3.8-Flash-Next 125B, ~18 min start
 qwenx status                          # active sessions + compute-unit balance
 qwenx stop                            # cleanup, always safe
 ```
+
+## Tiers
+
+| Tier | Model | Ready in | Warm speed | Use |
+|---|---|---|---|---|
+| `standard` (default) | `qwen3.8:27b` | ~3 min | ~78 tok/s | almost everything |
+| `max` | `qwen3.8-flash-next:125b-a6b-q4_K_M` | ~18 min | ~47 tok/s | big batches where quality matters |
+
+Measured on Colab's 80 GB A100 (the default `--high-mem` shape). Details in `SKILL.md`.
 
 ## Lifetime guarantees
 

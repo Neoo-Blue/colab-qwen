@@ -1,6 +1,6 @@
 ---
 name: colab-qwen
-description: Offload a self-contained task to a Qwen model (default qwen3.8:27b via Ollama) running on a Google Colab A100 that is started for the task and stopped right after. Use for heavy, batchable, or long-context work where a strong open model is good enough and Claude's own budget or context is the constraint - bulk summarization, classification or extraction over many files, a long-log or long-document digest, drafting many independent variants, an alternate solution to compare. Spends Colab compute units (A100 80 GB about 7 CU/hour) and has a 3-6 minute cold start, so never use it for quick questions, live facts, anything secret, or work a free peer (Grok, Antigravity) handles. Also the reference for the qwenx CLI and the colab-qwen-worker sub-agent, and invocable as /colab-qwen.
+description: Offload a self-contained task to a Qwen model (standard tier qwen3.8:27b, max tier Qwen3.8-Flash-Next 125B, via Ollama) running on a Google Colab A100 that is started for the task and stopped right after. Use for heavy, batchable, or long-context work where a strong open model is good enough and Claude's own budget or context is the constraint - bulk summarization, classification or extraction over many files, a long-log or long-document digest, drafting many independent variants, an alternate solution to compare. Spends Colab compute units (A100 80 GB about 7 CU/hour) and has a ~3 minute cold start (~18 on the max tier), so never use it for quick questions, live facts, anything secret, or work a free peer (Grok, Antigravity) handles. Also the reference for the qwenx CLI and the colab-qwen-worker sub-agent, and invocable as /colab-qwen.
 ---
 
 # Colab Qwen worker
@@ -25,7 +25,7 @@ Nothing stays up between calls. The bridge is the `qwenx` CLI in this folder
    (default 60) even if `qwenx` itself is killed. If a run ends with
    `NOT CONFIRMED STOPPED`, or you are unsure, run `qwenx stop` then `qwenx status`
    immediately. Stopping a stopped session is harmless.
-3. **Batch, don't loop.** Cold start (allocate + install + 18 GB pull) is 3-6 minutes and
+3. **Batch, don't loop.** Cold start is ~3 minutes on the standard tier (~18 on max) and
    costs more than most single answers. Ten prompts = one `qwenx batch`, never ten `qwenx run`.
 4. **No secrets.** The prompt goes to a Google VM. Never send credentials, `.env` contents,
    customer data, or anything from `~/.claude/sesame`.
@@ -78,26 +78,35 @@ Before a big batch, check `qwenx status` (balance and active sessions).
 ## Sub-agent brief header lines
 
 ```
-model: qwen3.6:35b        # optional Ollama tag, default qwen3.8:27b
+tier: max                 # optional: Qwen3.8-Flash-Next 125B (slow start, stronger); default standard
+model: gemma4:31b         # optional Ollama tag, overrides the tier's model
 think: yes                # optional reasoning mode (slower, better on hard problems)
 ctx: 65536                # optional context window, default 32768
 files: /abs/a.log,/abs/b.md   # optional files attached as context
 <the task, self-contained>
 ```
 
-## Models
+## Tiers and models
 
-Any Ollama library tag works with `-m`. `QWENX_MODEL` changes the default.
+Two tiers, benchmarked 2026-10-10 on the 80 GB A100 with the same coding and reasoning prompts:
 
-| Tag | Use | Notes |
-|---|---|---|
-| `qwen3.8:27b` (default) | general reasoning, coding, long-context digest | dense, 18 GB pull, fits the 80 GB A100 with room for a large context |
-| `qwen3.6:35b` | throughput-heavy batches | MoE, 24 GB pull, few active params so faster tokens per second |
-| `gemma4:31b` | a second family for comparison, multilingual | dense, 20 GB pull |
+| Tier | Model | Ready in | Warm speed | Short batch cost | Pick when |
+|---|---|---|---|---|---|
+| `standard` (default) | `qwen3.8:27b` (dense, 18 GB) | ~3 min | ~78 tok/s, all on GPU | ~1 CU | almost always: digests, extraction, drafts, most code |
+| `max` (`-t max`) | `qwen3.8-flash-next:125b-a6b-q4_K_M` (MoE 125B, 6B active, 120 GB) | ~18 min | ~47 tok/s, 70% GPU / 30% CPU | ~2.5 CU | a big batch where answer quality matters more than ~15 min and ~1.5 CU of extra startup |
 
-If a tag fails to pull, `qwenx` reports the `ollama pull` error; check
-https://ollama.com/library for the current name. Bigger models pull slower and every run
-pays that pull again, so prefer the smallest model that does the job.
+`max` is not faster; it is the stronger model. In the benchmark both tiers got the reasoning
+task right; on the coding task both functions were correct, but only `max` also wrote correct
+tests. Only use `max` with enough work to amortise its startup, usually via `qwenx batch`.
+
+Any Ollama tag also works with `-m` (it overrides the tier's model), e.g. `gemma4:31b` for a
+second model family. `QWENX_MODEL` changes the standard tier's model. Not usable here: the
+`nvfp4` and `mlx` Flash-Next builds need Apple's MLX runtime, and the 40 GB A100
+(`--no-high-mem`) cannot hold the `max` model.
+
+Every run downloads the model again, because Colab wipes the VM on stop. That is deliberate:
+Ollama's registry measured ~1.3 GB/s from Colab, faster than Hugging Face (~40 MB/s) or a
+Google Drive cache, and Drive also needs a manual approval on every new VM.
 
 ## Cost
 
@@ -108,8 +117,9 @@ Measured 2026-10-10 (rates come from `colab usage` and move with demand):
 | A100 `--high-mem` (default) | A100-SXM4 **80 GB**, 167 GB RAM | ~6.8 CU/h |
 | A100 `--no-high-mem` | A100-SXM4 40 GB | ~5.3 CU/h |
 
-- A full single-prompt run took 4.7 min and ~0.4 CU: 152 s to ready (allocate, install,
-  18 GB pull), then the first answer includes loading the model into VRAM.
+- Standard tier: a two-prompt batch took 8.5 min and ~1 CU (ready in ~3 min; the first
+  answer also pays ~70 s to load the model into VRAM).
+- Max tier: the same batch took 22 min and ~2.5 CU (ready in ~18 min, ~110 s model load).
 - `qwenx` reads the live rate on every run and prints the estimated CU spent; trust that line.
 - `--gpu L4` costs less and is fine for small batches with a 27B model.
 - `qwenx status` shows the remaining balance. Tell the user what a large batch cost.
@@ -119,7 +129,7 @@ Measured 2026-10-10 (rates come from `colab usage` and move with demand):
 ```bash
 qwenx run "Summarize the failure modes in this log as a table" -f /var/log/app.log
 git diff main | qwenx run "Write a changelog entry for this diff" -f -
-qwenx run --think -m qwen3.6:35b "Propose three schema designs for ... and compare them"
+qwenx batch -t max -o /tmp/out tasks/*.md  # stronger model, ~18 min start: batches only
 qwenx batch -o /tmp/out tasks/*.md          # one GPU session for all of them
 qwenx batch --gpu L4 --max-minutes 30 -o out tasks/*.md
 qwenx run --json "..." | jq -r .content     # machine-readable result
@@ -128,7 +138,7 @@ qwenx stop                                  # cleanup, always safe
 qwenx selftest                              # offline wrapper check, no Colab call
 ```
 
-Flags shared by `run` and `batch`: `-m MODEL`, `-s SESSION` (default `qwen-a100`),
+Flags shared by `run` and `batch`: `-t {standard,max}`, `-m MODEL`, `-s SESSION` (default `qwen-a100`),
 `--gpu {T4,L4,G4,A100,H100}`, `--high-mem/--no-high-mem` (default on: 80 GB A100), `--ctx N`, `--think/--no-think`,
 `--system TEXT`, `--max-minutes N`, `--boot-timeout S`, `--gen-timeout S`, `--json`.
 
@@ -168,4 +178,4 @@ links for other agent tools, is in `README.md`.
 - A lock file per session name stops two runs from fighting over one VM; use `-s NAME` to
   run two in parallel (each one costs its own GPU).
 - `<think>` blocks are stripped from answers; `--json` keeps the separate `thinking` field.
-- State lives in `~/.cache/colab-qwen/` (lock, watchdog pid).
+- State lives in `~/.cache/colab-qwen/` (per-session lock and watchdog pid).

@@ -5,9 +5,9 @@ Every run is one GPU lifetime: colab new -> install + serve Ollama -> pull model
 -> colab stop. The GPU never outlives the command: try/finally, SIGTERM/SIGHUP handlers, and
 a detached watchdog that runs `colab stop` after --max-minutes even if qwenx is SIGKILLed.
 
-  qwenx run   [-m MODEL] [--think] [--ctx N] [-f FILE]... "prompt"   ("-" = prompt from stdin,
+  qwenx run   [-t max] [-m MODEL] [--think] [--ctx N] [-f FILE]... "prompt"   ("-" = prompt from stdin,
                                                                      "-f -" = stdin as context)
-  qwenx batch [-m MODEL] -o OUTDIR TASK.md [TASK.md ...]             one GPU session, many prompts
+  qwenx batch [-t max] [-m MODEL] -o OUTDIR TASK.md [TASK.md ...]             one GPU session, many prompts
   qwenx stop  [-s NAME]   stop a leftover session (always safe to run)
   qwenx status            active Colab sessions + compute-unit balance and burn rate
   qwenx selftest          offline check of the wrapper, makes no Colab call
@@ -37,7 +37,15 @@ import subprocess
 import time
 from pathlib import Path
 
-DEFAULT_MODEL = os.environ.get("QWENX_MODEL", "qwen3.8:27b")
+# Two tiers, benchmarked 2026-10-10 on the 80 GB A100 (same prompts):
+#   standard  qwen3.8:27b         ready 3 min, 78 tok/s, all on GPU, ~1 CU per short batch
+#   max       Flash-Next 125B-A6B ready 18 min, 47 tok/s, 70/30 GPU/CPU, ~2.5 CU; better output
+TIERS = {
+    "standard": {"model": os.environ.get("QWENX_MODEL", "qwen3.8:27b"),
+                 "boot_timeout": 1200, "max_minutes": 60},
+    "max": {"model": "qwen3.8-flash-next:125b-a6b-q4_K_M", "boot_timeout": 2400, "max_minutes": 90},
+}
+DEFAULT_MODEL = TIERS["standard"]["model"]
 DEFAULT_SESSION = os.environ.get("QWENX_SESSION", "qwen-a100")
 DEFAULT_GPU = os.environ.get("QWENX_GPU", "A100")
 STATE = Path(os.environ.get("QWENX_STATE", Path.home() / ".cache" / "colab-qwen"))
@@ -49,6 +57,7 @@ SYSTEM = ("You are a delegated worker for another AI agent. Do the task complete
 # Runs inside the Colab kernel (Python). Idempotent: safe to re-run on a warm session.
 BOOTSTRAP = r'''
 import json, os, shutil, subprocess, time, urllib.request
+_t0 = time.time()
 def _up():
     try:
         urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=2)
@@ -70,13 +79,15 @@ if not _up():
         time.sleep(1)
     else:
         raise RuntimeError("ollama serve did not start:\n" + open("/content/ollama.log").read()[-2000:])
+_t1 = time.time()
 _p = subprocess.run(["ollama", "pull", MODEL], capture_output=True, text=True)
+_t2 = time.time()
 if _p.returncode:
     raise RuntimeError("ollama pull %s failed: %s" % (MODEL, (_p.stderr or _p.stdout)[-1500:]))
 _gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                       capture_output=True, text=True).stdout.strip()
 print(BEGIN)
-print(json.dumps({"gpu": _gpu}))
+print(json.dumps({"gpu": _gpu, "install_s": round(_t1 - _t0), "pull_s": round(_t2 - _t1)}))
 print(END)
 '''
 
@@ -163,15 +174,56 @@ def payload(text: str) -> dict:
     return json.loads(text[i + len(BEGIN):j].strip())
 
 
-def remote(session: str, prelude: dict, body: str, timeout: float) -> dict:
-    code = "".join(f"{k} = {v!r}\n" for k, v in prelude.items())
-    code += f"BEGIN = {BEGIN!r}\nEND = {END!r}\n" + body
+# Long silent cells lose their websocket (the 120 GB Flash-Next pull hung `colab exec` until
+# its timeout), so each remote step runs as a detached job on the VM and is polled with short
+# execs. A dropped poll is just retried.
+LAUNCH = r'''
+import subprocess
+open(JOB + ".py", "w").write(SCRIPT)
+subprocess.Popen(["sh", "-c", 'python3 "$0.py" > "$0.out" 2>&1; touch "$0.done"', JOB],
+                 start_new_session=True)
+print(BEGIN); print("{}"); print(END)
+'''
+POLL = r'''
+import json, os
+if os.path.exists(JOB + ".done"):
+    print(open(JOB + ".out", errors="replace").read())
+else:
+    print(BEGIN); print(json.dumps({"running": True})); print(END)
+'''
+
+
+def _exec(session: str, code: str, timeout: float) -> dict:
+    code = f"BEGIN = {BEGIN!r}\nEND = {END!r}\n" + code
     r = colab("exec", "-s", session, "--timeout", str(int(timeout)), code=code,
-              timeout=timeout + 120, check=False)
+              timeout=timeout + 60, check=False)
     if r.returncode and BEGIN not in r.stdout:
         raise QwenxError(f"`colab exec` failed (exit {r.returncode}): "
                          f"{(r.stderr + r.stdout).strip()[-2000:]}")
     return payload(r.stdout + "\n" + r.stderr)
+
+
+def remote(session: str, prelude: dict, body: str, timeout: float, poll_s: float = 5) -> dict:
+    script = "".join(f"{k} = {v!r}\n" for k, v in prelude.items())
+    script += f"BEGIN = {BEGIN!r}\nEND = {END!r}\n" + body
+    job = f"/content/qwenx-{time.time_ns()}"
+    _exec(session, f"JOB = {job!r}\nSCRIPT = {script!r}\n" + LAUNCH, 120)
+    deadline, misses = time.time() + timeout, 0
+    while time.time() < deadline:
+        time.sleep(poll_s)
+        try:
+            res = _exec(session, f"JOB = {job!r}\n" + POLL, 90)
+            misses = 0
+        except QwenxError as e:
+            if "no result marker" in str(e):
+                raise  # the job finished and raised on the VM
+            misses += 1  # dropped connection: retry
+            if misses >= 6:
+                raise
+            continue
+        if not res.get("running"):
+            return res
+    raise QwenxError(f"remote step exceeded {timeout:.0f}s")
 
 
 def strip_think(text: str) -> str:
@@ -202,8 +254,8 @@ def read_prompt(words: list[str], files: list[str]) -> str:
     return "\n\n".join(parts)
 
 
-def _kill_watchdog() -> None:
-    pidfile = STATE / "watchdog.pid"
+def _kill_watchdog(session: str) -> None:
+    pidfile = STATE / f"watchdog-{session}.pid"
     try:
         os.killpg(int(pidfile.read_text()), signal.SIGTERM)
     except (OSError, ValueError):
@@ -226,13 +278,13 @@ def session_lifetime(args, jobs):
     except BlockingIOError:
         raise QwenxError(f"another qwenx run holds session '{args.session}'; wait, or use -s NAME")
 
-    _kill_watchdog()  # left behind by a run that was SIGKILLed
+    _kill_watchdog(args.session)  # left behind by a run with this name that was SIGKILLed
     colab("stop", "-s", args.session, check=False, timeout=90)  # leftover with our name, if any
     wd = subprocess.Popen(
         ["sh", "-c", f"sleep {int(args.max_minutes * 60)}; colab stop -s {args.session}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         env=colab_env())
-    (STATE / "watchdog.pid").write_text(str(wd.pid))
+    (STATE / f"watchdog-{args.session}.pid").write_text(str(wd.pid))
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _raise_interrupt)
 
@@ -240,11 +292,14 @@ def session_lifetime(args, jobs):
     try:
         log(f"allocating {args.gpu} as session '{args.session}' (watchdog stops it at "
             f"{args.max_minutes:g} min)")
-        new = ["new", "-s", args.session, "--gpu", args.gpu] + (["--high-mem"] if args.high_mem else [])
+        # --high-mem picks the 80 GB A100; G4/L4 have one shape and the backend rejects it on G4
+        hm = args.high_mem and args.gpu.upper() in ("A100", "T4")
+        new = ["new", "-s", args.session, "--gpu", args.gpu] + (["--high-mem"] if hm else [])
         colab(*new, timeout=600)
         log(f"VM up in {time.time() - t0:.0f}s; installing Ollama and pulling {args.model}")
         info = remote(args.session, {"MODEL": args.model}, BOOTSTRAP, args.boot_timeout)
-        log(f"ready at {time.time() - t0:.0f}s on {info.get('gpu') or args.gpu}")
+        log(f"ready at {time.time() - t0:.0f}s on {info.get('gpu') or args.gpu} "
+            f"(ollama install {info.get('install_s', '?')}s, model pull {info.get('pull_s', '?')}s)")
         m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
         rate = float(m.group(1)) if m else None
         for name, prompt in jobs:
@@ -268,8 +323,15 @@ def session_lifetime(args, jobs):
                 stopped = True
                 break
             time.sleep(2 ** attempt)
+        if not stopped:  # stop fails when the watchdog already released it: ask the server
+            r = colab("sessions", check=False, timeout=60)
+            stopped = (r.returncode == 0 and f"[{args.session}]" not in r.stdout
+                       and "[?] gpu-" not in r.stdout)  # an unnamed GPU may be ours: not confirmed
+            if "[?] gpu-" in r.stdout:
+                log("WARNING: a GPU session with no local name is still assigned; release it in "
+                    "the Colab UI (Runtime > Manage sessions)")
         if stopped:
-            _kill_watchdog()
+            _kill_watchdog(args.session)
         else:
             log(f"WARNING: `colab stop -s {args.session}` failed 3 times; the watchdog is still "
                 f"armed. Check `qwenx status` now.")
@@ -327,7 +389,7 @@ def cmd_batch(args) -> int:
 def cmd_stop(args) -> int:
     r = colab("stop", "-s", args.session, check=False, timeout=120)
     print((r.stdout + r.stderr).strip())
-    _kill_watchdog()
+    _kill_watchdog(args.session)
     return r.returncode
 
 
@@ -351,7 +413,9 @@ def cmd_selftest(_args) -> int:
     req = build_request("m", "p", "s", 8192, None)
     assert "think" not in req and req["options"]["num_ctx"] == 8192
     assert build_request("m", "p", "s", 8192, False)["think"] is False
-    for body, prelude in ((BOOTSTRAP, {"MODEL": "m"}), (GENERATE, {"REQ_B64": "", "TIMEOUT": 1})):
+    for body, prelude in ((BOOTSTRAP, {"MODEL": "m"}), (GENERATE, {"REQ_B64": "", "TIMEOUT": 1}),
+                          (LAUNCH, {"JOB": "/j", "SCRIPT": "", "BEGIN": "", "END": ""}),
+                          (POLL, {"JOB": "/j", "BEGIN": "", "END": ""})):
         compile("".join(f"{k} = {v!r}\n" for k, v in prelude.items()) + body, "remote", "exec")
     print("selftest ok")
     return 0
@@ -363,7 +427,10 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def gpu_opts(p):
-        p.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"Ollama tag (default {DEFAULT_MODEL})")
+        p.add_argument("-t", "--tier", choices=TIERS, default="standard",
+                       help="standard: qwen3.8:27b, fast start. max: Qwen3.8-Flash-Next 125B, "
+                            "better output, ~15 min extra start; use for big batches")
+        p.add_argument("-m", "--model", help="Ollama tag; overrides the tier's model")
         p.add_argument("-s", "--session", default=DEFAULT_SESSION)
         p.add_argument("--gpu", default=DEFAULT_GPU, help="T4, L4, G4, A100, H100 (default A100)")
         p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
@@ -376,9 +443,9 @@ def main() -> int:
         th.add_argument("--no-think", dest="think", action="store_const", const=False)
         p.set_defaults(think=False)
         p.add_argument("--system", default=SYSTEM, help="system prompt")
-        p.add_argument("--max-minutes", type=float, default=60,
-                       help="hard cap: the watchdog stops the VM after this (default 60)")
-        p.add_argument("--boot-timeout", type=float, default=1200, help="install+pull budget, s")
+        p.add_argument("--max-minutes", type=float,
+                       help="hard cap: the watchdog stops the VM after this (tier default 60/90)")
+        p.add_argument("--boot-timeout", type=float, help="install+pull budget, s (tier default)")
         p.add_argument("--gen-timeout", type=float, default=1800, help="per-prompt budget, s")
         p.add_argument("--json", action="store_true")
 
@@ -402,6 +469,10 @@ def main() -> int:
     sub.add_parser("selftest", help="offline wrapper check").set_defaults(fn=cmd_selftest)
 
     args = ap.parse_args()
+    if hasattr(args, "tier"):  # fill whatever the caller did not set from the tier
+        for k, v in TIERS[args.tier].items():
+            if getattr(args, k) is None:
+                setattr(args, k, v)
     try:
         return args.fn(args)
     except QwenxError as e:
