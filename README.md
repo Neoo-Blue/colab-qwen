@@ -6,7 +6,7 @@ GPU, serves the model with Ollama, gets the answer, and stops the GPU in the sam
 is left running between tasks.
 
 - **`SKILL.md`**: when to use it (and when not), the workflow, hard rules, models, and cost
-- **`qwenx`**: the CLI (stdlib-only Python 3.8+; macOS, Linux, Windows via WSL2). `run`, `batch`, `stop`, `status`, `selftest`
+- **`qwenx`**: the CLI (stdlib-only Python 3.9+; macOS, Linux, Windows via WSL2). `run`, `batch`, `stop`, `status`, `selftest`
 - **`agents/colab-qwen-worker.md`**: a sub-agent relay so Claude can dispatch a task in the
   background via the Agent tool
 
@@ -35,6 +35,11 @@ wsl --install -d Ubuntu
 Reboot, open the **Ubuntu** app, and run the Linux step above inside it. Run Claude Code
 (or Codex, OpenCode, etc.) inside WSL too, so the agent and `qwenx` share one environment.
 Native Windows `qwenx` exits with a message pointing here.
+
+**macOS certificate note.** The Colab CLI's live connection to the VM uses Python's default
+certificate store, which is empty on python.org and uv-managed Pythons
+(`CERTIFICATE_VERIFY_FAILED`). `qwenx` handles this by pointing `SSL_CERT_FILE` at the
+certifi bundle inside the CLI's own environment; set `SSL_CERT_FILE` yourself to override.
 
 ### 2. Colab CLI and sign-in
 
@@ -85,7 +90,7 @@ qwenx stop                            # cleanup, always safe
 
 Every run stops its session in a `finally` block, on Ctrl-C / SIGTERM / SIGHUP, and through a
 detached watchdog that runs `colab stop` after `--max-minutes` (default 60) even if `qwenx` is
-killed outright. A100 burns roughly 7-8 compute units per hour; `qwenx` prints the live rate and
+killed outright. The default A100 (80 GB, high-RAM shape) burns about 6.8 compute units per hour (40 GB: ~5.3); `qwenx` prints the live rate and
 the estimated spend at the end of each run.
 
 ## License

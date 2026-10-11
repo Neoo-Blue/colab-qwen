@@ -1,6 +1,6 @@
 ---
 name: colab-qwen
-description: Offload a self-contained task to a Qwen model (default qwen3.8:27b via Ollama) running on a Google Colab A100 that is started for the task and stopped right after. Use for heavy, batchable, or long-context work where a strong open model is good enough and Claude's own budget or context is the constraint - bulk summarization, classification or extraction over many files, a long-log or long-document digest, drafting many independent variants, an alternate solution to compare. Spends Colab compute units (A100 about 7-8 CU/hour) and has a 3-6 minute cold start, so never use it for quick questions, live facts, anything secret, or work a free peer (Grok, Antigravity) handles. Also the reference for the qwenx CLI and the colab-qwen-worker sub-agent, and invocable as /colab-qwen.
+description: Offload a self-contained task to a Qwen model (default qwen3.8:27b via Ollama) running on a Google Colab A100 that is started for the task and stopped right after. Use for heavy, batchable, or long-context work where a strong open model is good enough and Claude's own budget or context is the constraint - bulk summarization, classification or extraction over many files, a long-log or long-document digest, drafting many independent variants, an alternate solution to compare. Spends Colab compute units (A100 80 GB about 7 CU/hour) and has a 3-6 minute cold start, so never use it for quick questions, live facts, anything secret, or work a free peer (Grok, Antigravity) handles. Also the reference for the qwenx CLI and the colab-qwen-worker sub-agent, and invocable as /colab-qwen.
 ---
 
 # Colab Qwen worker
@@ -91,7 +91,7 @@ Any Ollama library tag works with `-m`. `QWENX_MODEL` changes the default.
 
 | Tag | Use | Notes |
 |---|---|---|
-| `qwen3.8:27b` (default) | general reasoning, coding, long-context digest | dense, 18 GB pull, fits A100 40 or 80 GB with a large context |
+| `qwen3.8:27b` (default) | general reasoning, coding, long-context digest | dense, 18 GB pull, fits the 80 GB A100 with room for a large context |
 | `qwen3.6:35b` | throughput-heavy batches | MoE, 24 GB pull, few active params so faster tokens per second |
 | `gemma4:31b` | a second family for comparison, multilingual | dense, 20 GB pull |
 
@@ -101,11 +101,17 @@ pays that pull again, so prefer the smallest model that does the job.
 
 ## Cost
 
-- A100: budget about **7-8 CU/hour**; public reports put it at 10-15 CU/hour depending on
-  shape and demand (Colab publishes no fixed rate). `qwenx` reads the live rate from
-  `colab usage` on every run and prints the estimated CU spent, so trust that line.
-- Fixed overhead per run: 3-6 minutes of startup, about 0.4-0.8 CU before the first token.
-- `--gpu L4` is roughly a third of the A100 rate and fine for small batches with a 27B model.
+Measured 2026-10-10 (rates come from `colab usage` and move with demand):
+
+| Shape | GPU | Rate |
+|---|---|---|
+| A100 `--high-mem` (default) | A100-SXM4 **80 GB**, 167 GB RAM | ~6.8 CU/h |
+| A100 `--no-high-mem` | A100-SXM4 40 GB | ~5.3 CU/h |
+
+- A full single-prompt run took 4.7 min and ~0.4 CU: 152 s to ready (allocate, install,
+  18 GB pull), then the first answer includes loading the model into VRAM.
+- `qwenx` reads the live rate on every run and prints the estimated CU spent; trust that line.
+- `--gpu L4` costs less and is fine for small batches with a 27B model.
 - `qwenx status` shows the remaining balance. Tell the user what a large batch cost.
 
 ## CLI recipes
@@ -123,7 +129,7 @@ qwenx selftest                              # offline wrapper check, no Colab ca
 ```
 
 Flags shared by `run` and `batch`: `-m MODEL`, `-s SESSION` (default `qwen-a100`),
-`--gpu {T4,L4,G4,A100,H100}`, `--high-mem`, `--ctx N`, `--think/--no-think`,
+`--gpu {T4,L4,G4,A100,H100}`, `--high-mem/--no-high-mem` (default on: 80 GB A100), `--ctx N`, `--think/--no-think`,
 `--system TEXT`, `--max-minutes N`, `--boot-timeout S`, `--gen-timeout S`, `--json`.
 
 ## Setup (once)
