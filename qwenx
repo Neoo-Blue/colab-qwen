@@ -38,12 +38,14 @@ import time
 from pathlib import Path
 
 # Two tiers, benchmarked 2026-10-10 on the 80 GB A100 (same prompts):
-#   standard  qwen3.8:27b         ready 3 min, 78 tok/s, all on GPU, ~1 CU per short batch
-#   max       Flash-Next 125B-A6B ready 18 min, 47 tok/s, 70/30 GPU/CPU, ~2.5 CU; better output
+#   standard  qwen3.8:27b on Ollama      ready 3 min, 78 tok/s, ~1 CU per short batch
+#   max       Qwen3.8-Flash-Next on Strata (github.com/Niko1221/Strata), IQ3_S:
+#             ready 21 min (compile 3 + download 9 + draft layer 6 + load 3), 75-105 tok/s,
+#             ~2.5 CU per short batch. Ollama ran the same model at 47 tok/s.
 TIERS = {
-    "standard": {"model": os.environ.get("QWENX_MODEL", "qwen3.8:27b"),
+    "standard": {"engine": "ollama", "model": os.environ.get("QWENX_MODEL", "qwen3.8:27b"),
                  "boot_timeout": 1200, "max_minutes": 60},
-    "max": {"model": "qwen3.8-flash-next:125b-a6b-q4_K_M", "boot_timeout": 2400, "max_minutes": 90},
+    "max": {"engine": "strata", "model": "IQ3_S", "boot_timeout": 2700, "max_minutes": 90},
 }
 DEFAULT_MODEL = TIERS["standard"]["model"]
 DEFAULT_SESSION = os.environ.get("QWENX_SESSION", "qwen-a100")
@@ -87,7 +89,62 @@ if _p.returncode:
 _gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                       capture_output=True, text=True).stdout.strip()
 print(BEGIN)
-print(json.dumps({"gpu": _gpu, "install_s": round(_t1 - _t0), "pull_s": round(_t2 - _t1)}))
+print(json.dumps({"gpu": _gpu, "steps": "ollama install %ds, model pull %ds" % (_t1 - _t0, _t2 - _t1)}))
+print(END)
+'''
+
+# Strata (Qwen3.8-Flash-Next engine). MODEL is a Strata size: IQ3_S, IQ3_XXS, IQ2_XS, Q2_0.
+# Colab specifics: python3 lacks ensurepip (STRATA_UV=1 makes setup use uv), there is no
+# ready-made A100 engine (setup compiles one, ~3 min), and Colab's Jupyter owns port 8080.
+STRATA_BOOT = r'''
+import json, glob, os, subprocess, time, urllib.request
+_t0 = time.time()
+subprocess.run("pip -q install uv", shell=True, check=True, capture_output=True)
+if not os.path.isdir("/content/Strata"):
+    subprocess.run("git clone --depth 1 -q https://github.com/Niko1221/Strata /content/Strata", shell=True, check=True)
+_p = subprocess.run("cd /content/Strata && STRATA_UV=1 ./setup.sh --yes --family qwen --model %s --no-start "
+                    "--port 8090 --data-dir /content/Strata-data > /content/strata-setup.log 2>&1" % MODEL,
+                    shell=True, stdin=subprocess.DEVNULL)
+if _p.returncode:
+    raise RuntimeError("strata setup failed:\n" + open("/content/strata-setup.log", errors="replace").read()[-3000:])
+_t1 = time.time()
+def _up():
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8090/health", timeout=5)
+        return True
+    except Exception:
+        return False
+if not _up():
+    _srv = subprocess.Popen("cd /content/Strata && %s" % sorted(glob.glob("/content/Strata/run-*.sh"))[0], shell=True,
+                            stdin=subprocess.DEVNULL, stdout=open("/content/strata-server.log", "w"),
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    while not _up():
+        if _srv.poll() is not None:
+            raise RuntimeError("strata server exited:\n" + open("/content/strata-server.log", errors="replace").read()[-3000:])
+        time.sleep(10)
+_gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                      capture_output=True, text=True).stdout.strip()
+print(BEGIN)
+print(json.dumps({"gpu": _gpu, "steps": "strata setup %ds, model load %ds" % (_t1 - _t0, time.time() - _t1)}))
+print(END)
+'''
+
+STRATA_GENERATE = r'''
+import base64, json, time, urllib.request
+_req = json.loads(base64.b64decode(REQ_B64))
+_body = {"model": "strata", "messages": _req["messages"], "max_tokens": 16384,
+         "reasoning_effort": "high" if _req.get("think") else "none"}
+_t = time.time()
+_out = json.loads(urllib.request.urlopen(urllib.request.Request(
+    "http://127.0.0.1:8090/v1/chat/completions", data=json.dumps(_body).encode(),
+    headers={"Content-Type": "application/json"}), timeout=TIMEOUT).read())
+_dt = time.time() - _t
+_u = _out.get("usage", {})
+print(BEGIN)
+print(json.dumps({"content": _out["choices"][0]["message"].get("content") or "", "thinking": "",
+                  "eval_count": _u.get("completion_tokens", 0), "eval_ns": int(_dt * 1e9),
+                  "prompt_count": _u.get("prompt_tokens", 0), "total_ns": int(_dt * 1e9),
+                  "load_ns": 0, "ollama_ps": "strata " + _req["model"]}))
 print(END)
 '''
 
@@ -296,10 +353,10 @@ def session_lifetime(args, jobs):
         hm = args.high_mem and args.gpu.upper() in ("A100", "T4")
         new = ["new", "-s", args.session, "--gpu", args.gpu] + (["--high-mem"] if hm else [])
         colab(*new, timeout=600)
-        log(f"VM up in {time.time() - t0:.0f}s; installing Ollama and pulling {args.model}")
-        info = remote(args.session, {"MODEL": args.model}, BOOTSTRAP, args.boot_timeout)
-        log(f"ready at {time.time() - t0:.0f}s on {info.get('gpu') or args.gpu} "
-            f"(ollama install {info.get('install_s', '?')}s, model pull {info.get('pull_s', '?')}s)")
+        boot, gen = (STRATA_BOOT, STRATA_GENERATE) if args.engine == "strata" else (BOOTSTRAP, GENERATE)
+        log(f"VM up in {time.time() - t0:.0f}s; setting up {args.engine} with {args.model}")
+        info = remote(args.session, {"MODEL": args.model}, boot, args.boot_timeout)
+        log(f"ready at {time.time() - t0:.0f}s on {info.get('gpu') or args.gpu} ({info.get('steps', '')})")
         m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
         rate = float(m.group(1)) if m else None
         for name, prompt in jobs:
@@ -308,7 +365,7 @@ def session_lifetime(args, jobs):
                 req = build_request(args.model, prompt, args.system, args.ctx, args.think)
                 res = remote(args.session, {
                     "REQ_B64": base64.b64encode(json.dumps(req).encode()).decode(),
-                    "TIMEOUT": args.gen_timeout}, GENERATE, args.gen_timeout)
+                    "TIMEOUT": args.gen_timeout}, gen, args.gen_timeout)
                 res["content"] = strip_think(res["content"])
                 res["wall_s"] = round(time.time() - t1, 1)
                 yield name, res
@@ -415,7 +472,8 @@ def cmd_selftest(_args) -> int:
     assert build_request("m", "p", "s", 8192, False)["think"] is False
     for body, prelude in ((BOOTSTRAP, {"MODEL": "m"}), (GENERATE, {"REQ_B64": "", "TIMEOUT": 1}),
                           (LAUNCH, {"JOB": "/j", "SCRIPT": "", "BEGIN": "", "END": ""}),
-                          (POLL, {"JOB": "/j", "BEGIN": "", "END": ""})):
+                          (POLL, {"JOB": "/j", "BEGIN": "", "END": ""}),
+                          (STRATA_BOOT, {"MODEL": "IQ3_S"}), (STRATA_GENERATE, {"REQ_B64": "", "TIMEOUT": 1})):
         compile("".join(f"{k} = {v!r}\n" for k, v in prelude.items()) + body, "remote", "exec")
     print("selftest ok")
     return 0
@@ -428,9 +486,11 @@ def main() -> int:
 
     def gpu_opts(p):
         p.add_argument("-t", "--tier", choices=TIERS, default="standard",
-                       help="standard: qwen3.8:27b, fast start. max: Qwen3.8-Flash-Next 125B, "
-                            "better output, ~15 min extra start; use for big batches")
-        p.add_argument("-m", "--model", help="Ollama tag; overrides the tier's model")
+                       help="standard: qwen3.8:27b on Ollama, ~3 min start. max: Qwen3.8-Flash-Next 125B "
+                            "on Strata, faster and stronger but ~21 min start: big batches only")
+        p.add_argument("-m", "--model", help="Ollama tag (or Strata size with --engine strata); "
+                                             "an explicit Ollama tag switches the engine to ollama")
+        p.add_argument("--engine", choices=("ollama", "strata"), help="default: the tier's engine")
         p.add_argument("-s", "--session", default=DEFAULT_SESSION)
         p.add_argument("--gpu", default=DEFAULT_GPU, help="T4, L4, G4, A100, H100 (default A100)")
         p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
@@ -470,6 +530,8 @@ def main() -> int:
 
     args = ap.parse_args()
     if hasattr(args, "tier"):  # fill whatever the caller did not set from the tier
+        if args.model and not args.engine and ":" in args.model:
+            args.engine = "ollama"  # `-m some:tag` means an Ollama model, whatever the tier
         for k, v in TIERS[args.tier].items():
             if getattr(args, k) is None:
                 setattr(args, k, v)
